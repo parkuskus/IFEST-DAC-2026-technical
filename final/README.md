@@ -1,107 +1,27 @@
-# Final Round IFEST Data Analysis Competition 2026
+# IFEST DAC 2026 final round
 
-> Prediksi risiko kekurangan air (_water stress_) bulan berikutnya per sub-DAS.
+## The problem
 
-## 1. Ringkasan Tugas
+Predict whether a HUC12 watershed will experience water stress next month. The submission ranks test rows by risk, using a score from 0 to 1 in the `label` column. The competition evaluates Average Precision. Around 20 percent of the training rows have a positive label.
 
-Ketersediaan air ditentukan oleh pasokan dan penggunaan yang berubah dari waktu ke waktu.
-Peserta membangun model _machine learning_ untuk peringatan dini: **apakah suatu sub-DAS (HUC12) akan mengalami _water stress_ bulan depan**, dari riwayat hidrologi + penggunaan air.
+## Data
 
-- Input: 1 baris = 1 sub-DAS pada 1 bulan _origin_, berisi jendela 12 bulan ke belakang (`lag0..lag11`).
-- Output: skor risiko kontinu `0–1` (makin tinggi = makin berisiko).
-- Model harus mengenali: pola musiman, kondisi hidrologis, kebutuhan air, dan hubungan antarwilayah dalam jaringan sungai, serta menggeneralisasi ke sub-DAS / periode baru.
+The official training set has 378,780 rows from 2,196 watersheds across 168 monthly origins. The public test set has 11,928 rows from 2,982 watersheds across four origins. Each row carries a 12-month window of baseflow, quickflow, water supply, and withdrawals. Climate medians, watershed area, population estimates, and downstream identifiers provide additional context. `row_id` identifies test rows and must be preserved in the submission.
 
-## 2. Evaluasi
+The notebook expects `train.csv`, `test_public.csv`, and `sample_submission.csv` under the directory set by `Settings.DATA_DIR`. None of those files were present in the source folder. The default setting points to a Kaggle input path and must be changed for a local run.
 
-Metrik: **Average Precision (AP) / PR-AUC**.
+## The notebook
 
-```text
-AP = sum_n (R_n - R_{n-1}) * P_n
-```
+[`notebooks/Final_DAC_2026_psi-1.ipynb`](notebooks/Final_DAC_2026_psi-1.ipynb) reads the raw files as strings because the numbers mix decimal and thousands separators. It repairs climate values with inconsistent units and builds 139 ratio features. Ratios were chosen because the public test set changes the scale of raw flow values for individual watersheds.
 
-- `P_n` = Precision pada threshold ke-n, `R_n` = Recall pada threshold ke-n.
-- Dipilih karena biner tidak seimbang (positif ~20,4% di train). Kirim **probabilitas**, bukan label biner.
-- AP hanya peduli **urutan** skor, bukan skala absolutnya.
+The model blends four members. One is LightGBM. The other three are RealMLP models that predict different ordinal bins for the next month's supply ratio. Four seeds are used per member, followed by an equal-weight average across members. Validation uses held-out time blocks with an 11-month gap between training and validation windows. This is closer to the test setting than a random row split.
 
-## 3. Data
+The output goes to `Settings.OUTPUT_DIR/submission.csv` with `row_id,label` columns. The notebook checks that each test row appears once and that the scores are finite. A full run requires the competition data, LightGBM, PyTorch, pytabkit, and the other imported Python packages.
 
-Lihat `data/data_dictionary.csv` untuk definisi lengkap.
+## Why the pipeline is shaped this way
 
-| File                              | Isi                                                                                                                        |
-| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `train.csv` (~378.780 baris)      | Fitur + `label` (`1` jika SUI target >= threshold). = 2.196 `id` x 168 `origin` berurutan.                                 |
-| `test_public.csv` (~11.928 baris) | Fitur tanpa `label` + `row_id`. = 2.982 `id` x 4 `origin` (bulan origin 2, 4, 10, 12). ~73,6% `id` pernah muncul di train. |
-| `sample_submission.csv`           | Contoh format submisi.                                                                                                     |
+The training and public test files mix number formats, and some climate values use the wrong unit. A parser that treats every comma as a thousands separator would quietly corrupt those rows. The notebook repairs the values before it derives features. Its 139 ratios preserve relationships between supply, withdrawals, and climate even when the raw measurements for a test watershed have been multiplied by a different scale factor.
 
-Fitur utama:
+The presentation compares LightGBM with the ordinal RealMLP variants and reports that the combined prediction performs better than the individual candidates in its evaluation. It also identifies current supply and the next month's climate median as major drivers of the model score. Lower supply tends to raise predicted risk. This is a feature attribution result, not proof that one measured variable alone causes the outcome. The broader risk triage and persistence findings are summarized in the [project README](../README.md).
 
-- Identitas / jaringan: `id`, `to_id` (`OUTLET` jika hilir), `origin_id` (acak, bukan urutan waktu), `month` (campuran angka + nama).
-- Statik: `inc_aream2`, `cum_aream2`, `pop_dec_*`, `pop_acs_2020`.
-- Dinamis 12 lag: `q_bf_inc` (baseflow), `q_qf_inc` (quickflow), `q_ws_cum` (supply kumulatif), `q_ir/th/ps_wd_inc` (withdrawal irigasi / termoelektrik / publik).
-- Klimatologi: `clim_median_now` (bulan origin), `clim_median_next` (bulan target). Konstan per (`id`, bulan kalender).
-- `aux_*`: kolom umpan / duplikat (lihat §4).
-
-## 4. Jebakan Data (temuan notebook `notebooks/Final_DAC_2026_psi-1.ipynb`)
-
-1. **Format angka campuran:** gaya AS `71,086,157.853` bercampur gaya Eropa `244668757,724`. Token ambigu seperti `244,668` diselesaikan via modus per `id` (statik) atau per (`id`, `month`) (klimatologi).
-2. **Format bulan campuran:** `'1'..'12'` + nama bulan 3 varian penulisan -> dikanonkan ke `month_num`.
-3. **`aux_*` adalah umpan:** `aux_constant_*` konstan, `aux_twin_unit_*` = kolom lag / 1000, `aux_fake_mm_*` = `inc_aream2` / 10000 + noise, `aux_junk_id_*` = `ref-XXXXXXXX`, `aux_noise_*` = noise terstandarisasi. Dibuang.
-4. **Pergeseran skala test:** semua `q_*` + `clim_*` di test dikalikan satu faktor per `id` (kuantil 5–95%: 0,27–4,06, konstan dalam satu `id`). Nilai mentah dan lookup per-`id` dari train rusak; **hanya rasio dalam-baris yang selamat**. Solusi: 103 fitur invarian-skala (rasio klimatologi + bentuk jendela + fisika).
-5. **`origin_id` teracak:** kronologi train direkonstruksi dari overlap lag (lag0..10 baris lama = lag1..11 baris baru) -> 168 bulan berurutan, `t=0` bulan 9 sampai `t=167` bulan 8. Test berada di periode yang tidak ada di train -> validasi harus **blok waktu** (`t >= 134`, purge 11 bulan), bukan split acak / per-`id`.
-6. **Cold-start:** ~26% `id` test baru -> dilarang fitur memorizing `id`.
-7. **Ketidakseimbangan kelas:** baseline 0,20. Fitur `1 - ws_lag0 / clim_now` saja sudah AP ~0,46.
-
-## 5. Format Submisi
-
-```csv
-row_id,label
-0,0.0142
-1,0.7653
-2,0.0031
-```
-
-- `row_id`: jangan diubah, tepat satu kali, urutan sama seperti `sample_submission.csv`.
-- `label`: `0–1`, tanpa NaN.
-
-## 6. Pendekatan Singkat (EXP-102)
-
-`jendela 12 bulan + klimatologi now/next -> 103 fitur rasio -> LightGBM (600 pohon) + RealMLP (4x256, 8 epoch) -> rata-rata peringkat -> P(stress)`
-
-- Validasi blok-waktu: LightGBM AP 0,7663, RealMLP 0,7573, Ensemble 0,7685.
-- LightGBM kuat di origin Oktober, RealMLP kuat di Februari/Desember; korelasi peringkat ~0,92.
-- Sengaja _underfit_ (lr kecil, epoch pendek, dropout 0,15, wd 0,05): model yang terlalu pas ke periode train anjlok di periode baru.
-
-## 7. Cara Menjalankan
-
-1. Ubah `Settings.DATA_DIR` / `OUTPUT_DIR` jika di Colab/Kaggle.
-2. Jalankan `notebooks/Final_DAC_2026_psi-1.ipynb` dari awal sampai akhir (butuh GPU untuk RealMLP, CPU untuk LightGBM).
-3. Output: `submission.csv` (`row_id,label`).
-
-## 8. Aturan Lomba (Final DAC IFEST 2026)
-
-### 8.1 Deliverables
-
-- Source code notebook: `Final_DAC2026_NamaTim.ipynb`, wajib menyertakan seed untuk randomness.
-- File PPT hasil analisis dataset baru yang disediakan panitia: `Presentasi_DAC2026_NamaTim`.
-- Pengumpulan source code + PPT hanya oleh perwakilan tim.
-- Notebook harus bisa di-run ulang dari awal sampai akhir tanpa error dengan output konsisten.
-
-### 8.2 Presentasi final (Zoom)
-
-- Presentasi hasil analisis di depan juri via Zoom Meeting dengan PPT yang sudah dikumpulkan.
-- Durasi: 10 menit presentasi + 5 menit tanya jawab dewan juri.
-- Keterlambatan tidak mendapat tambahan waktu.
-- Tim yang tidak konfirmasi kehadiran sampai batas waktu dinyatakan didiskualifikasi.
-
-### 8.3 Batasan pemodelan
-
-- Dilarang dataset eksternal dalam bentuk apa pun selama analisis, latih, validasi, maupun pengembangan solusi.
-- Dilarang pretrained model / checkpoint / weights / embeddings. Arsitektur standar/kompleks boleh dipakai asal seluruh bobot diinisialisasi acak dan dilatih sepenuhnya dari awal (*from scratch*).
-- Dilarang pipeline AutoML penuh. Komponen Hyperparameter Optimization (HPO) seperti Optuna / Ray Tune / GridSearchCV diperbolehkan.
-- Wajib kunci `random seed` di awal notebook untuk semua pustaka relevan (`random`, NumPy, scikit-learn, XGBoost, LightGBM, PyTorch, TensorFlow).
-
-### 8.4 Sanksi & ketentuan umum
-
-- Pelanggaran aturan dapat berujung diskualifikasi berdasarkan pemeriksaan dan keputusan panitia.
-- Pengumuman juara dan pemberian hadiah pada tanggal yang ditentukan via email dan media publikasi IFEST 2026.
-- Ketentuan teknis dapat berubah sewaktu-waktu dan diinformasikan via kanal resmi IFEST 2026.
+The final-round rules forbid external datasets and pretrained model weights. See [`GUIDEBOOK DAC IFEST 2026.md`](GUIDEBOOK%20DAC%20IFEST%202026.md) for the original summary kept in this archive.
